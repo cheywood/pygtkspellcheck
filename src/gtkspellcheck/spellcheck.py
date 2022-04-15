@@ -26,6 +26,7 @@ interface it can use Gedit’s translation files.
 import enchant
 import gettext
 import logging
+import os
 import re
 import sys
 
@@ -49,25 +50,9 @@ class NoGtkBindingFound(Exception):
     Could not find any loaded Gtk binding.
     """
 
-if sys.version_info.major == 3:
-    _py3k = True
-else:
-    _py3k = False
-    
-if _py3k:
-    # there is only the gi binding for Python 3
-    from gi.repository import Gtk as gtk
-    _pygobject = True
-else:
-    # find any loaded gtk binding
-    if 'gi.repository.Gtk' in sys.modules:
-        gtk = sys.modules['gi.repository.Gtk']
-        _pygobject = True
-    elif 'gtk' in sys.modules:
-        gtk = sys.modules['gtk']
-        _pygobject = False
-    else:
-        raise NoGtkBindingFound('could not find any loaded Gtk binding')
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk as gtk, Gio, GLib, GObject
 
 # select base list class
 try:
@@ -79,8 +64,7 @@ except ImportError:
 
 
 # select base string
-if _py3k:
-    basestring = str
+basestring = str
 
 # map between Gedit's translation and PyGtkSpellcheck's
 _GEDIT_MAP = {'Languages' : 'Languages',
@@ -104,7 +88,7 @@ def code_to_name(code, separator='_'):
     except (LanguageNotFound, CountryNotFound):
         return '{} ({})'.format(_('Unknown'), code)
 
-class SpellChecker(object):
+class SpellChecker(GObject.Object):
     """
     Main spellchecking class, everything important happens here.
 
@@ -181,14 +165,11 @@ class SpellChecker(object):
         def move(self, location):
             self._buffer.move_mark(self._mark, location)
 
-    def __init__(self, view, language='en', prefix='gtkspellchecker',
+    def __init__(self, view, language=None, prefix='gtkspellchecker',
                  collapse=True, params={}):
+        super().__init__()
         self._view = view
         self.collapse = collapse
-        self._view.connect('populate-popup',
-                           lambda entry, menu:self._extend_menu(menu))
-        self._view.connect('popup-menu', self._click_move_popup)
-        self._view.connect('button-press-event', self._click_move_button)
         self._prefix = prefix
         self._broker = enchant.Broker()
         for param, value in params.items(): self._broker.set_param(param, value)
@@ -209,6 +190,15 @@ class SpellChecker(object):
             else:
                 logger.critical('no dictionaries found')
                 raise NoDictionariesFound()
+
+        extra_menu = self._view.get_extra_menu()
+        if extra_menu is None:
+            extra_menu = Gio.Menu()
+            self._view.set_extra_menu(extra_menu)
+        self._spelling_menu = Gio.Menu()
+        extra_menu.append_section(None, self._spelling_menu)
+        self.__languages_menu = Gio.MenuItem.new_submenu(_('Languages'), self._languages_menu())
+
         self._dictionary = self._broker.request_dict(self._language)
         self._deferred_check = False
         self._filters = dict(SpellChecker.DEFAULT_FILTERS)
@@ -222,21 +212,74 @@ class SpellChecker(object):
         self._enabled = True
         self.buffer_initialize()
 
-    @property
-    def language(self):
+        controller = gtk.GestureClick()
+        controller.set_button(0)
+        controller.connect("pressed", self.__on_click_pressed)
+        self.__controller = controller
+        self._view.add_controller(controller)
+
+        self.__setup_actions()
+
+    def __on_click_pressed(self, click: gtk.GestureClick, n_press: int, x: float, y: float) -> None:
+        # TODO this type of approach would I believe be better (ala gnome-text-editor) but 
+        #      the sequence always seems to return null
+
+        # sequence = click.get_current_sequence()
+        # event = click.get_last_event(sequence)
+        # if n_press != 1 or not gdk_event_triggers_context_menu (event):
+
+        if n_press != 1 or click.get_current_button() != 3:
+            return
+
+        self.__move_for_popup(x, y)
+        self.__populate_menu()
+
+    @GObject.Property(type=str, default="")
+    def language(self) -> str:
         """
         The language used for spellchecking.
         """
         return self._language
 
     @language.setter
-    def language(self, language):
+    def language(self, language: str) -> None:
         if language != self._language and self.languages.exists(language):
             self._language = language
             self._dictionary = self._broker.request_dict(language)
             self.recheck()
 
-    @property
+    def __setup_actions(self) -> None:
+        action_group = Gio.SimpleActionGroup.new()
+        self.__actions = {}
+        app = Gio.Application.get_default()
+
+        action = Gio.SimpleAction.new("ignore-all", GLib.VariantType("s"))
+        action.connect("activate", self.__ignore_all)
+        action_group.add_action(action)
+
+        action = Gio.SimpleAction.new("add-to-dictionary", GLib.VariantType("s"))
+        action.connect("activate", self.__add_to_dictionary)
+        action_group.add_action(action)
+
+        action = Gio.SimpleAction.new("suggestion", GLib.VariantType("s"))
+        action.connect("activate", self.__apply_suggestion)
+        action_group.add_action(action)
+
+        language = Gio.PropertyAction.new("language", self, "language")
+        action_group.add_action(language)
+
+        self._view.insert_action_group("spelling", action_group)
+
+    def __ignore_all(self, _action: Gio.SimpleAction, word: GLib.Variant):
+        self.ignore_all(word.get_string())
+
+    def __add_to_dictionary(self, _action: Gio.SimpleAction, word: GLib.Variant):
+        self.add_to_dictionary(word.get_string())
+
+    def __apply_suggestion(self, _action: Gio.SimpleAction, suggestion: GLib.Variant):
+        self._replace_word(suggestion.get_string())
+
+    @GObject.Property(type=bool, default=False)
     def enabled(self):
         """
         Enable or disable spellchecking.
@@ -256,11 +299,8 @@ class SpellChecker(object):
         have associated a new GtkTextBuffer with the GtkTextView call this
         method.
         """
-        if _pygobject:
-            self._misspelled = gtk.TextTag.new('{}-misspelled'\
-                                               .format(self._prefix))
-        else:
-            self._misspelled = gtk.TextTag('{}-misspelled'.format(self._prefix))
+        self._misspelled = gtk.TextTag.new('{}-misspelled'\
+                                           .format(self._prefix))
         self._misspelled.set_property('underline', 4)
         self._buffer = self._view.get_buffer()
         self._buffer.connect('insert-text', self._before_text_insert)
@@ -288,10 +328,7 @@ class SpellChecker(object):
         self._table.foreach(tag_added, None)
         self.no_spell_check = self._table.lookup('no-spell-check')
         if not self.no_spell_check:
-            if _pygobject:
-                self.no_spell_check = gtk.TextTag.new('no-spell-check')
-            else:
-                self.no_spell_check = gtk.TextTag('no-spell-check')
+            self.no_spell_check = gtk.TextTag.new('no-spell-check')
             self._table.add(self.no_spell_check)
         self.recheck()
 
@@ -447,138 +484,58 @@ class SpellChecker(object):
             word_start = word_end.copy()
 
     def _languages_menu(self):
-        def _set_language(item, code):
-            self.language = code
-        if _pygobject:
-            menu = gtk.Menu.new()
-            group = []
-        else:
-            menu = gtk.Menu()
-            group = gtk.RadioMenuItem()
-        connect = []
+        menu = Gio.Menu.new()
         for code, name in self.languages:
-            if _pygobject:
-                item = gtk.RadioMenuItem.new_with_label(group, name)
-                group.append(item)
-            else:
-                item = gtk.RadioMenuItem(group, name)
-            if code == self.language:
-                item.set_active(True)
-            connect.append((item, code))
-            menu.append(item)
-        for item, code in connect:
-            item.connect('activate', _set_language, code)
+            item = Gio.MenuItem.new(name, None)
+            item.set_action_and_target_value("spelling.language", GLib.Variant.new_string(code))
+            menu.append_item(item)
         return menu
 
     def _suggestion_menu(self, word):
         menu = []
         suggestions = self._dictionary.suggest(word)
-        if not suggestions:
-            if _pygobject:
-                item = gtk.MenuItem.new()
-                label = gtk.Label.new('')
-            else:
-                item = gtk.MenuItem()
-                label = gtk.Label()
-            try:
-                label.set_halign(gtk.Align.LEFT)
-            except AttributeError:
-                label.set_alignment(0.0, 0.5)
-            label.set_markup('<i>{text}</i>'.format(text=_('(no suggestions)')))
-            item.add(label)
+        for suggestion in suggestions:
+            escaped = suggestion.replace("'", "\\'")
+            item = Gio.MenuItem.new(suggestion, f"spelling.suggestion('{escaped}')")
             menu.append(item)
-        else:
-            for suggestion in suggestions:
-                if _pygobject:
-                    item = gtk.MenuItem.new()
-                    label = gtk.Label.new('')
-                else:
-                    item = gtk.MenuItem()
-                    label = gtk.Label()
-                label.set_markup('<b>{text}</b>'.format(text=suggestion))
-                try:
-                    label.set_halign(gtk.Align.LEFT)
-                except AttributeError:
-                    label.set_alignment(0.0, 0.5)
-                item.add(label)
-                item.connect('activate', self._replace_word, word, suggestion)
-                menu.append(item)
-        if _pygobject:
-            menu.append(gtk.SeparatorMenuItem.new())
-            item = gtk.MenuItem.new_with_label(
-                _('Add "{}" to Dictionary').format(word))
-        else:
-            menu.append(gtk.SeparatorMenuItem())
-            item = gtk.MenuItem(_('Add "{}" to Dictionary').format(word))
-        item.connect('activate', lambda *args: self.add_to_dictionary(word))
+        escaped = word.replace("'", "\\'")
+        item = Gio.MenuItem.new( _('Add to Dictionary').format(word), f"spelling.add-to-dictionary('{escaped}')")
         menu.append(item)
-        if _pygobject:
-            item = gtk.MenuItem.new_with_label(_('Ignore All'))
-        else:
-            item = gtk.MenuItem(_('Ignore All'))
-        item.connect('activate', lambda *args: self.ignore_all(word))
+        item = Gio.MenuItem.new(_('Ignore'), f"spelling.ignore-all('{escaped}')")
         menu.append(item)
         return menu
 
-    def _extend_menu(self, menu):
-        if not self._enabled:
-            return
-        if _pygobject:
-            separator = gtk.SeparatorMenuItem.new()
-        else:
-            separator = gtk.SeparatorMenuItem()
-        separator.show()
-        menu.prepend(separator)
-        if _pygobject:
-            languages = gtk.MenuItem.new_with_label(_('Languages'))
-        else:
-            languages = gtk.MenuItem(_('Languages'))
-        languages.set_submenu(self._languages_menu())
-        languages.show_all()
-        menu.prepend(languages)
+    def __populate_menu(self):
+        menu = self._spelling_menu
+        menu.remove_all()
+        menu.append_item(self.__languages_menu)
+
         if self._marks['click'].inside_word:
             start, end = self._marks['click'].word
             if start.has_tag(self._misspelled):
-                if _py3k:
-                    word = self._buffer.get_text(start, end, False)
-                else:
-                    word = self._buffer.get_text(start, end,
-                                                 False).decode('utf-8')
+                word = self._buffer.get_text(start, end, False)
                 items = self._suggestion_menu(word)
                 if self.collapse:
-                    if _pygobject:
-                        suggestions = gtk.MenuItem.new_with_label(
-                            _('Suggestions'))
-                        submenu = gtk.Menu.new()
-                    else:
-                        suggestions = gtk.MenuItem(_('Suggestions'))
-                        submenu = gtk.Menu()
+                    label = _('Suggestions')
+                    suggestions = Gio.MenuItem.new(label, None)
+                    submenu = Gio.Menu.new()
                     for item in items:
-                        submenu.append(item)
+                        submenu.append_item(item)
                     suggestions.set_submenu(submenu)
-                    suggestions.show_all()
-                    menu.prepend(suggestions)
+                    menu.prepend_item(suggestions)
                 else:
                     items.reverse()
                     for item in items:
-                        menu.prepend(item)
-                        menu.show_all()
+                        menu.prepend_item(item)
 
-    def _click_move_popup(self, *args):
-        self._marks['click'].move(self._buffer.get_iter_at_mark(
-            self._buffer.get_insert()))
-        return False
-
-    def _click_move_button(self, widget, event):
-        if event.button == 3:
-            if self._deferred_check:  self._check_deferred_range(True)
-            x, y = self._view.window_to_buffer_coords(2, int(event.x),
-                                                      int(event.y))
-            iter = self._view.get_iter_at_location(x, y)
-            if isinstance(iter, tuple):
-                iter = iter[1]
-            self._marks['click'].move(iter)
-        return False
+    def __move_for_popup(self, popup_x, popup_y):
+        if self._deferred_check:  self._check_deferred_range(True)
+        x, y = self._view.window_to_buffer_coords(2, int(popup_x),
+                                                  int(popup_y))
+        iter = self._view.get_iter_at_location(x, y)
+        if isinstance(iter, tuple):
+            iter = iter[1]
+        self._marks['click'].move(iter)
 
     def _before_text_insert(self, textbuffer, location, text, length):
         self._marks['insert-start'].move(location)
@@ -595,14 +552,15 @@ class SpellChecker(object):
         if mark == self._buffer.get_insert() and self._deferred_check:
             self._check_deferred_range(False)
 
-    def _replace_word(self, item, old_word, new_word):
+    def _replace_word(self, new_word):
+    # def _replace_word(self, item, old_word, new_word):
         start, end = self._marks['click'].word
         offset = start.get_offset()
         self._buffer.begin_user_action()
         self._buffer.delete(start, end)
         self._buffer.insert(self._buffer.get_iter_at_offset(offset), new_word)
         self._buffer.end_user_action()
-        self._dictionary.store_replacement(old_word, new_word)
+        # self._dictionary.store_replacement(old_word, new_word)
 
     def _check_deferred_range(self, force_all):
         start = self._marks['insert-start'].iter
@@ -615,39 +573,28 @@ class SpellChecker(object):
         for tag in self.ignored_tags:
             if start.has_tag(tag):
                 return
-        if _py3k:
-            word = self._buffer.get_text(start, end, False).strip()
-        else:
-            word = self._buffer.get_text(start, end, False).decode('utf-8').strip()
+        word = self._buffer.get_text(start, end, False).strip()
         if not word:
             return
         if len(self._filters[SpellChecker.FILTER_WORD]):
             if self._regexes[SpellChecker.FILTER_WORD].match(word):
                 return
         if len(self._filters[SpellChecker.FILTER_LINE]):
-            line_start = self._buffer.get_iter_at_line(start.get_line())
+            _success, line_start = self._buffer.get_iter_at_line(start.get_line())
             line_end = end.copy()
             line_end.forward_to_line_end()
-            if _py3k:
-                line = self._buffer.get_text(line_start, line_end, False)
-            else:
-                line = self._buffer.get_text(line_start, line_end,
-                                             False).decode('utf-8')
+            line = self._buffer.get_text(line_start, line_end, False)
             for match in self._regexes[SpellChecker.FILTER_LINE].finditer(line):
                 if match.start() <= start.get_line_offset() <= match.end():
-                    start = self._buffer.get_iter_at_line_offset(
+                    _success, start = self._buffer.get_iter_at_line_offset(
                         start.get_line(), match.start())
-                    end = self._buffer.get_iter_at_line_offset(start.get_line(),
+                    _success, end = self._buffer.get_iter_at_line_offset(start.get_line(),
                                                                match.end())
                     self._buffer.remove_tag(self._misspelled, start, end)
                     return
         if len(self._filters[SpellChecker.FILTER_TEXT]):
             text_start, text_end = self._buffer.get_bounds()
-            if _py3k:
-                text = self._buffer.get_text(text_start, text_end, False)
-            else:
-                text = self._buffer.get_text(text_start, text_end,
-                                             False).decode('utf-8')
+            text = self._buffer.get_text(text_start, text_end, False)
             for match in self._regexes[SpellChecker.FILTER_TEXT].finditer(text):
                 if match.start() <= start.get_offset() <= match.end():
                     start = self._buffer.get_iter_at_offset(match.start())
