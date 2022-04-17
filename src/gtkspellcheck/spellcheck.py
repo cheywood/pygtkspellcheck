@@ -450,10 +450,10 @@ class SpellChecker(GObject.Object):
         """
         if not self._enabled:
             return
-        if end.inside_word(): end.forward_word_end()
-        if not start.starts_word() and (start.inside_word() or
-                                        start.ends_word()):
-            start.backward_word_start()
+        if end.inside_word(): 
+            SpellChecker.__iter_forward_word_end(end)
+        if SpellChecker.__between_middle_and_end_of_word(start):
+            SpellChecker.__iter_backward_word_start(start)
         self._buffer.remove_tag(self._misspelled, start, end)
         cursor = self._buffer.get_iter_at_mark(self._buffer.get_insert())
         precursor = cursor.copy()
@@ -461,14 +461,15 @@ class SpellChecker(GObject.Object):
         highlight = (cursor.has_tag(self._misspelled) or
                      precursor.has_tag(self._misspelled))
         if not start.get_offset():
-            start.forward_word_end()
-            start.backward_word_start()
+            SpellChecker.__iter_forward_word_end(start)
+            SpellChecker.__iter_backward_word_start(start)
         word_start = start.copy()
         while word_start.compare(end) < 0:
             word_end = word_start.copy()
-            word_end.forward_word_end()
+            SpellChecker.__iter_forward_word_end(word_end)
             in_word = ((word_start.compare(cursor) < 0) and
                        (cursor.compare(word_end) <= 0))
+            wword = self._buffer.get_text(word_start, word_end, False)
             if in_word and not force_all:
                 if highlight:
                     self._check_word(word_start, word_end)
@@ -477,11 +478,79 @@ class SpellChecker(GObject.Object):
             else:
                 self._check_word(word_start, word_end)
                 self._deferred_check = False
-            word_end.forward_word_end()
-            word_end.backward_word_start()
+            SpellChecker.__iter_forward_word_end(word_end)
+            SpellChecker.__iter_backward_word_start(word_end)
             if word_start.equal(word_end):
                 break
             word_start = word_end.copy()
+
+    @staticmethod
+    def __between_middle_and_end_of_word(loc: gtk.TextIter) -> bool:
+        if loc.starts_word():
+            if loc.is_start():
+                return False
+
+            # Determine if actually in word after extra chars
+            loc = loc.copy()
+            loc.backward_char()
+            if not SpellChecker.__is_extra_word_char(loc):
+                return False
+
+            if loc.is_start():
+                return False
+            loc.backward_char()
+            return loc.inside_word()
+        else:
+            return loc.inside_word() or loc.ends_word()
+
+    @staticmethod
+    def __is_extra_word_char(loc: gtk.TextIter) -> bool:
+        ch = loc.get_char()
+
+        if ch == " " or ch == "\n" or ch == "\t" or ch == "\r":
+            return False
+
+        if ch == "'":
+            return True
+
+        # Language extra chararacters should also be processed here but as Enchant's 
+        # enchant_dict_get_extra_word_characters isn't exposed that's not the case today.
+
+        return False
+
+    @staticmethod
+    def __iter_forward_word_end(loc: gtk.TextIter) -> bool:
+        tmp = loc.copy()
+        if loc.forward_word_end():
+            tmp = loc.copy()
+
+            if SpellChecker.__is_extra_word_char(tmp):
+                if SpellChecker.__iter_forward_word_end(tmp):
+                    loc.assign(tmp)
+
+            return True
+
+        if loc.is_end() and loc.ends_word() and not tmp.equal(loc):
+            return True
+
+        return False
+
+    @staticmethod
+    def __iter_backward_word_start(loc: gtk.TextIter) -> bool:
+        tmp = loc.copy()
+        if loc.backward_word_start():
+            tmp = loc.copy()
+
+            if tmp.backward_char() and SpellChecker.__is_extra_word_char(tmp):
+                if SpellChecker.__iter_backward_word_start(tmp):
+                    loc.assign(tmp)
+
+            return True
+
+        if loc.is_start() and loc.starts_word() and not tmp.equal(loc):
+            return True
+
+        return False
 
     def _languages_menu(self):
         menu = Gio.Menu.new()
