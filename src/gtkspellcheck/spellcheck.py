@@ -75,6 +75,9 @@ _GEDIT_MAP = {'Languages' : 'Languages',
               'Add "{}" to Dictionary' : 'Add w_ord',
               'Unknown' : 'Unknown'}
 
+_BATCHING_THRESHOLD_CHARS = 1500
+_BATCH_SIZE_CHARS = 1000
+
 # translation
 if gettext.find('gedit'):
     _gedit = gettext.translation('gedit', fallback=True).gettext
@@ -201,6 +204,8 @@ class SpellChecker(GObject.Object):
                     logger.critical('No dictionaries found')
                     raise NoDictionariesFound()
 
+        self._batching = False
+
         extra_menu = self._view.get_extra_menu()
         if extra_menu is None:
             extra_menu = Gio.Menu()
@@ -257,6 +262,17 @@ class SpellChecker(GObject.Object):
             self._language = language
             self._dictionary = self._broker.request_dict(language)
             self.recheck()
+
+    @GObject.Property(type=bool, default=False)
+    def batching(self) -> bool:
+        """
+        Whether to enable batched rechecking of large buffers.
+        """
+        return self._batching_
+
+    @batching.setter
+    def batching(self, val: bool) -> None:
+        self._batching = val
 
     def __setup_actions(self) -> None:
         action_group = Gio.SimpleActionGroup.new()
@@ -347,7 +363,16 @@ class SpellChecker(GObject.Object):
         Rechecks the spelling of the whole text.
         """
         start, end = self._buffer.get_bounds()
-        self.check_range(start, end, True)
+
+        batched = False
+        if self._batching:
+            if end.get_offset() > _BATCHING_THRESHOLD_CHARS:
+                batched = True
+                end = start.copy()
+                end.forward_chars(_BATCH_SIZE_CHARS)
+                end.forward_to_line_end()
+
+        self.check_range(start, end, force_all=True, batched_to_end=batched)
 
     def disable(self):
         """
@@ -451,7 +476,7 @@ class SpellChecker(GObject.Object):
         self._dictionary.add_to_session(word)
         self.recheck()
 
-    def check_range(self, start, end, force_all=False):
+    def check_range(self, start, end, force_all=False, batched_to_end=False):
         """
         Checks a specified range between two GtkTextIters.
 
@@ -493,6 +518,13 @@ class SpellChecker(GObject.Object):
             if word_start.equal(word_end):
                 break
             word_start = word_end.copy()
+
+        if batched_to_end and not end.is_end():
+            start = end.copy()
+            start.forward_char()
+            end.forward_chars(_BATCH_SIZE_CHARS)
+            end.forward_to_line_end()
+            GLib.idle_add(self.check_range, start, end, force_all, True)
 
     @staticmethod
     def __between_middle_and_end_of_word(loc: gtk.TextIter) -> bool:
@@ -644,7 +676,7 @@ class SpellChecker(GObject.Object):
     def _check_deferred_range(self, force_all):
         start = self._marks['insert-start'].iter
         end = self._marks['insert-end'].iter
-        self.check_range(start, end, force_all)
+        self.check_range(start, end, force_all=force_all)
 
     def _check_word(self, start, end):
         if start.has_tag(self.no_spell_check):
