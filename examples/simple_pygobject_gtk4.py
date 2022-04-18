@@ -24,10 +24,17 @@ sys.path.append(join(dirname(__file__), "../src/"))
 
 import gi
 import locale
+import logging
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
+from gi.repository import GObject, Gtk
 
 from gtkspellcheck import SpellChecker
+
+logging.basicConfig(
+    format="%(asctime)s | %(module)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO
+)
 
 class TestApp(Gtk.Application):
 
@@ -44,10 +51,15 @@ class TestApp(Gtk.Application):
         for code, name in self.spellchecker.languages:
             print("code: %5s, language: %s" % (code, name))
 
+        self.spellchecker.connect("notify::language", self.__language_changed)
+
         self.view = view
         window.set_child(view)
         app.add_window(window)
         window.present()
+
+    def __language_changed(self, _obj: GObject.Object, _spec: GObject.ParamSpec) -> None:
+        print(f"New language {self.spellchecker.language}")
 
 if __name__ == "__main__":
     app = TestApp()

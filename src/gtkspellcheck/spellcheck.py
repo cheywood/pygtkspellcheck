@@ -25,6 +25,7 @@ interface it can use Gedit’s translation files.
 
 import enchant
 import gettext
+import locale
 import logging
 import os
 import re
@@ -174,22 +175,31 @@ class SpellChecker(GObject.Object):
         self._broker = enchant.Broker()
         for param, value in params.items(): self._broker.set_param(param, value)
         self.languages = SpellChecker._LanguageList.from_broker(self._broker)
+        self._language = None
         if self.languages.exists(language):
             self._language = language
-        elif self.languages.exists('en'):
-            logger.warning(('no installed dictionary for language "{}", '
-                            'fallback to english'.format(language)))
-            self._language = 'en'
         else:
-            if self.languages:
-                self._language = self.languages[0][0]
-                logger.warning(('no installed dictionary for language "{}" '
-                                'and english, fallback to first language in'
-                                'language list ("{}")').format(language,
-                                                                self._language))
+            if not language is None:
+                logger.warning(f'Language {language} not available')
+            language = locale.getdefaultlocale()[0]
+            if self.languages.exists(language):
+                self._language = language
+                logger.info(f'Defaulting to locale default language "{self._language}"')
             else:
-                logger.critical('no dictionaries found')
-                raise NoDictionariesFound()
+                if self.languages:
+                    language = None
+                    for lang in ('en_GB', 'en_US', 'en'):
+                        if self.languages.exists(lang):
+                            self._language = self.languages[0][0]
+                            logger.info(f'Defaulting to "{lang}"')
+                            break
+                    if not self._language:
+                        self._language = self.languages[0][0]
+                        logger.info(('Defaulting to first language in language list '
+                                    f'("{self._language}")'))
+                else:
+                    logger.critical('No dictionaries found')
+                    raise NoDictionariesFound()
 
         extra_menu = self._view.get_extra_menu()
         if extra_menu is None:
