@@ -522,9 +522,8 @@ class SpellChecker(GObject.Object):
         if batched_to_end and not end.is_end():
             start = end.copy()
             start.forward_char()
-            end.forward_chars(_BATCH_SIZE_CHARS)
-            end.forward_to_line_end()
-            GLib.idle_add(self.check_range, start, end, force_all, True)
+            start_mark = self._buffer.create_mark(None, start) 
+            GLib.idle_add(self.__continue_batched_recheck, start_mark, force_all)
 
     @staticmethod
     def __between_middle_and_end_of_word(loc: gtk.TextIter) -> bool:
@@ -593,6 +592,14 @@ class SpellChecker(GObject.Object):
             return True
 
         return False
+
+    def __continue_batched_recheck(self, start_mark: gtk.TextMark, force_all: bool) -> None:
+        start = self._buffer.get_iter_at_mark(start_mark)
+        self._buffer.delete_mark(start_mark)
+        end = start.copy()
+        end.forward_chars(_BATCH_SIZE_CHARS)
+        end.forward_to_line_end()
+        self.check_range(start, end, force_all, True)
 
     def _languages_menu(self):
         menu = Gio.Menu.new()
