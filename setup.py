@@ -58,7 +58,7 @@ def read_variables():
         "__download_url__": "download_url",
     }
     for src, dst in mapping.items():
-        pattern = "\n{} = ('+)(.+?)\\1".format(src)
+        pattern = '\n{} = ("+)(.+?)\\1'.format(src)
         match = re.search(pattern, contents, re.DOTALL)
         if match:
             variables[dst] = match.group(2).strip()
