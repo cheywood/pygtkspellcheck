@@ -440,6 +440,8 @@ class SpellChecker(GObject.Object):
         def tag_added(tag, *args):
             if hasattr(tag, "spell_check") and not tag.spell_check:
                 self.ignored_tags.append(tag)
+            elif tag.name == "gtksourceview:context-classes:no-spell-check":
+                self.ignored_tags.append(tag)
 
         def tag_removed(tag, *args):
             if tag in self.ignored_tags:
